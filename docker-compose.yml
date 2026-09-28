@@ -1,16 +1,26 @@
-version: '3.8'
-
+# Chemins hôte configurables via .env (voir .env.example) ; valeurs par défaut =
+# dossiers du projet, donc rien à configurer si data/ et work_dirs/ sont à la racine.
 services:
   ijepa:
     build: .
+    image: cityscapes_ijepa_seg:latest
     container_name: cityscapes_ijepa_seg
-    runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - WANDB_API_KEY=${WANDB_API_KEY}
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - HF_HOME=/root/.cache/huggingface
     volumes:
       - .:/workspace
-      - ./work_dirs:/work_dirs
-      - ./data:/workspace/data   
-    shm_size: '32gb'
+      - ${DATA_DIR:-./data}:/workspace/data
+      - ${WORK_DIRS:-./work_dirs}:/workspace/work_dirs
+      # Cache HuggingFace persistant : évite de retélécharger I-JEPA ViT-H (~2.5 Go)
+      # à chaque recréation du conteneur
+      - ${HF_CACHE:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    shm_size: ${SHM_SIZE:-32gb}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     command: sleep infinity

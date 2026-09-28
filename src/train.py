@@ -1,8 +1,23 @@
 """
 Entraînement du convertisseur + décodeur sur Cityscapes, encodeur I-JEPA gelé.
 
-Usage :
-  python train.py --data-root /chemin/vers/cityscapes --output-dir work_dirs/run1
+Multi-GPU / précision mixte via HuggingFace Accelerate. Le même script tourne en
+mono-GPU (python) ou en distribué (accelerate launch) :
+
+  # mono-GPU (comportement identique à avant)
+  python src/train.py --data-root data/cityscapes --output-dir work_dirs/run1
+
+  # 4 GPU, DDP
+  accelerate launch --multi_gpu --num_processes 4 src/train.py --data-root data/cityscapes ...
+
+  # + précision mixte bf16
+  accelerate launch --multi_gpu --num_processes 4 --mixed_precision bf16 src/train.py ...
+
+--batch-size est PAR GPU : batch effectif = batch_size × nb_GPU × gradient_accumulation_steps.
+Pour reproduire un run mono-GPU batch 4 sur 4 GPU : --batch-size 1 (ou garder 4 et
+adapter le LR ; aucune mise à l'échelle automatique du LR n'est faite).
+Les checkpoints gardent exactement le même format (clés head/backbone/...) : test.py
+et --resume restent compatibles avec les anciens runs.
 """
 
 import argparse
@@ -13,7 +28,9 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 from model import IJepaSegmentationModel
 from dataset import CityscapesSegDataset
@@ -60,7 +77,10 @@ def seed_worker(worker_id: int):
     seed différente par worker (base_seed + worker_id) accessible via
     torch.initial_seed() — on s'en sert pour reseed random/numpy séparément.
     """
-    worker_seed = torch.initial_seed() % 2**32
+    # En distribué, le générateur du DataLoader est synchronisé entre processus :
+    # sans le rang dans la seed, tous les GPU tireraient la même séquence d'augmentations.
+    rank = int(os.environ.get("RANK", 0))
+    worker_seed = (torch.initial_seed() + 1_000_003 * rank) % 2**32
     random.seed(worker_seed)
     np.random.seed(worker_seed)
 
@@ -89,6 +109,10 @@ def main():
                          help="Nombre de dernières couches d'I-JEPA à dégeler (0 = backbone entièrement gelé)")
     parser.add_argument("--backbone-lr-mult", type=float, default=0.1,
                          help="Multiplicateur du LR pour les couches dégelées du backbone (relatif à --lr)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--mixed-precision", default=None, choices=["no", "fp16", "bf16"],
+                        help="Défaut : valeur de `accelerate launch --mixed_precision` / accelerate config "
+                             "(sinon fp32). Les runs existants ont été entraînés en fp32.")
     parser.add_argument("--wandb", action="store_true", help="Activer le logging Weights & Biases")
     parser.add_argument("--wandb-project", default="ijepa-cityscapes-seg")
     parser.add_argument("--run-name", default=None)
@@ -101,11 +125,32 @@ def main():
                               "ne pollue la comparaison.")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # find_unused_parameters : certains paramètres entraînables ne reçoivent jamais de
+    # gradient, ce que DDP refuse par défaut :
+    #  - le bloc transformer 32 quand --unfreeze-last-n couvre des couches au-delà de
+    #    max(--layer-indices) (la tête ne lit que hidden_states[31]) ;
+    #  - resConfUnit1 du premier bloc de fusion DPT (appelé avec une seule entrée).
+    # En mono-GPU ces paramètres restent simplement inchangés (AdamW les ignore) : même
+    # comportement ici.
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+    world = accelerator.num_processes
+    log = accelerator.print
 
-    if args.wandb:
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+    # Même seed sur tous les processus : initialisation de la tête identique
+    # (DDP la diffuse de toute façon depuis le rang 0).
+    set_seed(args.seed)
+    log(f"{world} processus | précision {accelerator.mixed_precision} | batch effectif "
+        f"{args.batch_size * world * args.gradient_accumulation_steps}")
+
+    if args.wandb and is_main:
         if not WANDB_AVAILABLE:
             raise ImportError("wandb n'est pas installé -- lancez `pip install wandb` ou retirez --wandb")
         wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args),
@@ -121,8 +166,12 @@ def main():
         prefetch_factor=4 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker, generator=loader_generator,
     )
+    # Validation : partition exacte des images entre processus (i::world), sans passer
+    # par accelerator.prepare dont le sampler dupliquerait des images pour égaliser les
+    # shards (500 % world != 0) et fausserait la matrice de confusion.
+    val_shard = Subset(val_set, range(accelerator.process_index, len(val_set), world))
     val_loader = DataLoader(
-        val_set, batch_size=1, shuffle=False, num_workers=args.num_workers,
+        val_shard, batch_size=1, shuffle=False, num_workers=args.num_workers,
         persistent_workers=args.num_workers > 0,
         prefetch_factor=4 if args.num_workers > 0 else None,
         worker_init_fn=seed_worker,
@@ -136,10 +185,14 @@ def main():
         decoder_type=args.decoder_type,
         fusion_type=args.fusion_type,
     ).to(device)
+    if world > 1 and device.type == "cuda":  # SyncBatchNorm n'existe que sur GPU
+        # BatchNorm des têtes simple/multidepth : statistiques sur le batch global
+        # plutôt que sur les batch_size images de chaque GPU.
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     n_trainable = sum(p.numel() for g in model.param_groups(args.lr) for p in g["params"])
     n_total = sum(p.numel() for p in model.parameters())
-    print(f"Paramètres entraînables : {n_trainable / 1e6:.1f}M / {n_total / 1e6:.1f}M total")
+    log(f"Paramètres entraînables : {n_trainable / 1e6:.1f}M / {n_total / 1e6:.1f}M total")
 
     optimizer = torch.optim.AdamW(
         model.param_groups(args.lr, args.backbone_lr_mult), weight_decay=0.01
@@ -151,14 +204,19 @@ def main():
     best_miou = 0.0
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location="cpu")
         model.head.load_state_dict(ckpt["head"])
         model.load_trainable_backbone_state_dict(ckpt.get("backbone", {}))
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_miou = ckpt["best_miou"]
-        print(f"Reprise depuis {args.resume} : epoch {start_epoch}, meilleur mIoU jusqu'ici {best_miou:.4f}")
+        log(f"Reprise depuis {args.resume} : epoch {start_epoch}, meilleur mIoU jusqu'ici {best_miou:.4f}")
+
+    # Le scheduler n'est PAS passé à prepare() : il est steppé une fois par epoch
+    # (T_max=epochs), alors qu'Accelerate le ferait avancer num_processes fois par appel.
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    raw_model = accelerator.unwrap_model(model)
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -166,72 +224,82 @@ def main():
         t0 = time.time()
 
         for i, (images, labels) in enumerate(train_loader):
-            images, labels = images.to(device), labels.to(device)
-
-            logits = model(images)
-            loss = criterion(logits, labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # prepare() a déjà placé le batch sur le bon device
+            with accelerator.accumulate(model):
+                logits = model(images)
+                loss = criterion(logits, labels)
+                accelerator.backward(loss)
+                optimizer.step()
+                optimizer.zero_grad()
 
             epoch_loss += loss.item()
             if i % 20 == 0:
-                print(f"[epoch {epoch}] step {i}/{len(train_loader)} - loss {loss.item():.4f}")
-                if args.wandb:
+                log(f"[epoch {epoch}] step {i}/{len(train_loader)} - loss {loss.item():.4f}")
+                if args.wandb and is_main:
                     wandb.log({"train/step_loss": loss.item(), "epoch": epoch})
 
         scheduler.step()
-        avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch} terminée en {time.time() - t0:.1f}s - loss moyenne {avg_loss:.4f}")
-        if args.wandb:
+        avg_loss = accelerator.reduce(
+            torch.tensor(epoch_loss / len(train_loader), device=device), reduction="mean"
+        ).item()
+        log(f"Epoch {epoch} terminée en {time.time() - t0:.1f}s - loss moyenne {avg_loss:.4f}")
+        if args.wandb and is_main:
             wandb.log({"train/epoch_loss": avg_loss, "lr": scheduler.get_last_lr()[0], "epoch": epoch})
 
-        torch.save(
-            {
-                "head": model.head.state_dict(),
-                "backbone": model.get_trainable_backbone_state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_miou": best_miou,
-            },
-            os.path.join(args.output_dir, "last.pth"),
-        )
-
         if (epoch + 1) % args.val_interval == 0:
-            model.eval()
-            conf_matrix = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long)
+            # Modèle "déballé" : pas de collectives DDP dans le forward, donc des shards
+            # de tailles différentes (500 % nb_GPU != 0) ne bloquent pas.
+            raw_model.eval()
+            conf_matrix = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long, device=device)
             with torch.no_grad(), torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
             ):
                 for images, labels in val_loader:
-                    images = images.to(device)
-                    logits = model(images)
-                    preds = logits.argmax(dim=1).cpu().flatten()
-                    update_confusion_matrix(conf_matrix, preds, labels.flatten(), NUM_CLASSES)
+                    logits = raw_model(images.to(device))
+                    preds = logits.argmax(dim=1).flatten()
+                    update_confusion_matrix(conf_matrix, preds, labels.to(device).flatten(), NUM_CLASSES)
+            conf_matrix = accelerator.reduce(conf_matrix, reduction="sum").cpu()
 
             miou = compute_miou(conf_matrix)
-            print(f"[val] epoch {epoch} - mIoU: {miou:.4f}")
-            if args.wandb:
+            log(f"[val] epoch {epoch} - mIoU: {miou:.4f}")
+            if args.wandb and is_main:
                 wandb.log({"val/miou": miou, "epoch": epoch})
 
             if miou > best_miou:
                 best_miou = miou
-                torch.save(
-                    {
-                        "head": model.head.state_dict(),
-                        "backbone": model.get_trainable_backbone_state_dict(),
-                        "epoch": epoch,
-                        "miou": miou,
-                    },
-                    os.path.join(args.output_dir, "best.pth"),
-                )
-                print(f"Nouveau meilleur modèle sauvegardé (mIoU {miou:.4f})")
+                if is_main:
+                    torch.save(
+                        {
+                            "head": raw_model.head.state_dict(),
+                            "backbone": raw_model.get_trainable_backbone_state_dict(),
+                            "epoch": epoch,
+                            "miou": miou,
+                        },
+                        os.path.join(args.output_dir, "best.pth"),
+                    )
+                log(f"Nouveau meilleur modèle sauvegardé (mIoU {miou:.4f})")
 
-    print(f"Entraînement terminé. Meilleur mIoU : {best_miou:.4f}")
-    if args.wandb:
+        # last.pth APRÈS la validation : sinon son best_miou retarde d'une validation et
+        # un --resume pourrait écraser un meilleur best.pth par un modèle moins bon.
+        accelerator.wait_for_everyone()
+        if is_main:
+            torch.save(
+                {
+                    "head": raw_model.head.state_dict(),
+                    "backbone": raw_model.get_trainable_backbone_state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "best_miou": best_miou,
+                },
+                os.path.join(args.output_dir, "last.pth"),
+            )
+        accelerator.wait_for_everyone()
+
+    log(f"Entraînement terminé. Meilleur mIoU : {best_miou:.4f}")
+    if args.wandb and is_main:
         wandb.finish()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

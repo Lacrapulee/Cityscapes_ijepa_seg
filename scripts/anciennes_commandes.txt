@@ -1,0 +1,8 @@
+# Anciennes commandes d'entraînement (déplacées depuis requirements.txt, qui ne doit
+# contenir que des dépendances pip). Chemins d'origine : /work_dirs → désormais
+# /workspace/work_dirs dans le conteneur.
+
+python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_simpleb8 --decoder-type simple --fusion-type multidepth --wandb --run-name simpleb8
+python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_simple_waterfallb8 --decoder-type simple --fusion-type feature --wandb --run-name run_simple_waterfallb8
+python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_dptb8 --decoder-type dpt --fusion-type feature --wandb --run-name run_dptb8
+python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_dpt_simpleb8 --decoder-type dpt --fusion-type multidepth --wandb --run-name run_dpt_simpleb8

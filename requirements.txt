@@ -1,18 +1,14 @@
-transformers>=4.40
+# torch / torchvision sont fournis par l'image de base pytorch/pytorch (ne pas les
+# réinstaller ici : pip pourrait tirer une build CUDA incompatible).
+transformers>=4.47      # IJepaModel (facebook/ijepa_vith14_22k)
+accelerate>=1.0         # multi-GPU / précision mixte (train.py, test.py)
 huggingface_hub
+timm
+datasets
+wandb
+pyyaml
 pillow
 numpy
- 
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_simpleb8 --decoder-type simple --fusion-type multidepth --wandb --run-name simpleb8 
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_simple_waterfallb8 --decoder-type simple --fusion-type feature --wandb --run-name run_simple_waterfallb8
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_dptb8 --decoder-type dpt --fusion-type feature --wandb --run-name run_dptb8
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_dpt_simpleb8 --decoder-type dpt --fusion-type multidepth --wandb --run-name run_dpt_simpleb8
-
-
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_simple_waterfallb8 --decoder-type simple --fusion-type feature --wandb --run-name run_simple_waterfallb8
-&&
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_simpleb8 --decoder-type simple --fusion-type multidepth --wandb --run-name simpleb8 
-&&
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_dptb8 --decoder-type dpt --fusion-type feature --wandb --run-name run_dptb8
-&&
-python src/train.py --data-root /workspace/data/cityscapes --output-dir /work_dirs/run_dpt_simpleb8 --decoder-type dpt --fusion-type multidepth --wandb --run-name run_dpt_simpleb8
+matplotlib              # figures de test.py
+opencv-python-headless  # test.py (points requêtes, export PNG)
+torchinfo               # src/print.py

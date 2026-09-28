@@ -51,7 +51,10 @@ class IJepaEncoder(nn.Module):
                     p.requires_grad = True
 
             if hasattr(self.encoder, "gradient_checkpointing_enable"):
-                self.encoder.gradient_checkpointing_enable()
+                # Non-réentrant : requis pour DDP (accelerate multi-GPU) ; mêmes gradients.
+                self.encoder.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
 
         self._sync_mode()
 

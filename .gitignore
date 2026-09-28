@@ -4,5 +4,6 @@ work_dirs/*
 src/__pycache__
 feature_maps/*
 model/*
+results/
 .env
 src/=4.40

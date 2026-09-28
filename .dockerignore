@@ -1,0 +1,12 @@
+# Le build n'a besoin que de requirements.txt : sans ce fichier, docker enverrait
+# data/ (Cityscapes, plusieurs dizaines de Go) et les checkpoints comme contexte de build.
+data/
+work_dirs/
+wandb/
+results/
+model/
+.git/
+**/__pycache__/
+*.pth
+*.pt
+.env

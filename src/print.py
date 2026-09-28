@@ -8,6 +8,8 @@ model = IJepaSegmentationModel(
         num_classes=19,
         layer_indices=[7, 15, 23, 31],
         unfreeze_last_n=0,
+        decoder_type="simple",
+        fusion_type="feature"
     )
 # Toujours passer le modèle en mode évaluation pour l'inférence/inspection
 
