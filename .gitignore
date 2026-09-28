@@ -1,0 +1,8 @@
+data/*
+wandb/*
+work_dirs/*
+src/__pycache__
+feature_maps/*
+model/*
+.env
+src/=4.40

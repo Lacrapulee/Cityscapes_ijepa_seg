@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  ijepa:
+    build: .
+    container_name: cityscapes_ijepa_seg
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    volumes:
+      - .:/workspace
+      - ./work_dirs:/work_dirs
+      - ./data:/workspace/data   
+    shm_size: '32gb'
+    command: sleep infinity
